@@ -1,3 +1,5 @@
 # Ignore cutout directory
 cutouts/
 sdss_dr18_lrg_sample.csv
+venv/
+psf_models/
