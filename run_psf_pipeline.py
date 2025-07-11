@@ -1,5 +1,4 @@
-# Step 4: Characterize cutout properties (image depth, PSF, etc) by SExtractor 
-# TODO: Ran this part in wsl ubuntu with default.conv, default.param, default.sex, and default.nnw files
+# Step 4: Characterize cutout properties of lenses (image depth, PSF, centroid, axis ratio, position angle) by SExtractor 
 
 import os
 import csv
@@ -7,14 +6,17 @@ import uuid
 import requests
 import subprocess
 import tempfile
+from glob import glob
+from collections import defaultdict
+from multiprocessing import Pool, Manager
 import numpy as np
 from astropy.io import fits
 from astropy.nddata import Cutout2D
 from scipy.ndimage import shift
-from collections import defaultdict
-from glob import glob
+from lmfit import Model, Parameters
+from astropy.modeling import models
 
-# === Configuration ===
+# === Config ===
 BANDS = ['g', 'r', 'i']
 CUTOUT_FOLDER = "cutouts"
 PSF_OUTPUT_FOLDER = "psf_models"
@@ -31,15 +33,24 @@ PSF_STACK_MAX = 11
 
 os.makedirs(PSF_OUTPUT_FOLDER, exist_ok=True)
 
-# === Query PanSTARRS PSF FWHM from MAST ===
+
+# === Shared PS1 FWHM cache ===
+ps1_cache = Manager().dict()  # shared among processes
+
+
 def query_ps1_psf_fwhm(ra, dec, band):
+    # round RA/Dec to 3 decimal to reduce identical queries
+    key = (round(ra, 3), round(dec, 3), band)
+    if key in ps1_cache:
+        return ps1_cache[key]
+
     base_url = "https://catalogs.mast.stsci.edu/api/v0.1/panstarrs/dr2/stack.csv"
     major_col = f"{band}psfMajorFWHM"
     minor_col = f"{band}psfMinorFWHM"
     params = {
         "ra": ra,
         "dec": dec,
-        "radius": 0.02,  # ~1.2 arcmin
+        "radius": 0.02,
         "nDetections.gt": 0,
         "columns": f"raMean,decMean,{major_col},{minor_col}"
     }
@@ -49,15 +60,12 @@ def query_ps1_psf_fwhm(ra, dec, band):
         lines = response.text.strip().split("\n")
         if len(lines) < 2:
             print("No data rows returned from PS1 query.")
+            ps1_cache[key] = None
             return None
 
         header = lines[0].split(",")
-        try:
-            major_idx = header.index(major_col)
-            minor_idx = header.index(minor_col)
-        except ValueError:
-            print(f"Columns {major_col} or {minor_col} not found in PS1 response header.")
-            return None
+        major_idx = header.index(major_col)
+        minor_idx = header.index(minor_col)
 
         fwhm_values = []
         for line in lines[1:]:
@@ -65,7 +73,6 @@ def query_ps1_psf_fwhm(ra, dec, band):
             try:
                 major_val = float(row[major_idx])
                 minor_val = float(row[minor_idx])
-                # Filter out invalid values (like -999 or unphysical values)
                 if 0 < major_val < 10 and 0 < minor_val < 10:
                     fwhm_values.append((major_val + minor_val) / 2)
             except (ValueError, IndexError):
@@ -73,15 +80,19 @@ def query_ps1_psf_fwhm(ra, dec, band):
 
         if not fwhm_values:
             print(f"No valid FWHM data found for band '{band}'.")
+            ps1_cache[key] = None
             return None
 
         avg_fwhm = sum(fwhm_values) / len(fwhm_values)
+        ps1_cache[key] = avg_fwhm
         return avg_fwhm
     except Exception as e:
         print(f"PS1 query failed: {e}")
+        ps1_cache[key] = None
         return None
 
-# === Run SExtractor ===
+
+# === SExtractor ===
 def run_sextractor(fits_path):
     catalog_path = os.path.join(tempfile.gettempdir(), f"sex_{uuid.uuid4().hex}.cat")
     cmd = [
@@ -97,16 +108,23 @@ def run_sextractor(fits_path):
         if not os.path.exists(catalog_path):
             print(f"SExtractor did not produce catalog for {fits_path}")
             return None
+
+        if os.path.getsize(catalog_path) == 0:
+            print(f"SExtractor produced empty catalog for {fits_path}")
+            return None
+
         data = np.genfromtxt(catalog_path, names=["X_IMAGE", "Y_IMAGE", "FWHM_IMAGE", "CLASS_STAR", "FLUX_AUTO"])
         if data.shape == ():  # single detection
             data = np.array([data])
         os.remove(catalog_path)
         return data
+
     except subprocess.CalledProcessError as e:
         print(f"SExtractor failed on {fits_path} with error: {e}")
         return None
 
-# === Extract PSF cutout ===
+
+# === PSF cutout ===
 def extract_psf_cutout(hdu_data, x, y, size=STAR_SIZE):
     try:
         cutout = Cutout2D(hdu_data, (x, y), (size, size), mode='partial', fill_value=0)
@@ -120,7 +138,8 @@ def extract_psf_cutout(hdu_data, x, y, size=STAR_SIZE):
         print(f"Cutout failed at position ({x}, {y}): {e}")
         return None
 
-# === Estimate image depth ===
+
+# === Image depth ===
 def estimate_image_depth(data, header):
     flattened = data.flatten()
     sigma = np.std(flattened)
@@ -130,14 +149,18 @@ def estimate_image_depth(data, header):
     depth = zp_avg - 2.5 * np.log10(5 * sigma) if sigma > 0 else None
     return sigma, depth, zp_avg
 
-# === Main processor ===
-# === Main processor ===
-def process_fits_file(fits_path, band):
+
+# === Main processing ===
+def process_fits_file(args):
+    fits_path, band = args  # unpack for pool.map
+
     basename = os.path.splitext(os.path.basename(fits_path))[0]
     output_dir = os.path.join(PSF_OUTPUT_FOLDER, band)
-    csv_file = os.path.join(output_dir, "psf_summary.csv")
     os.makedirs(output_dir, exist_ok=True)
     cutouts_by_bin = defaultdict(list)
+    csv_file = os.path.join(output_dir, "psf_summary.csv")
+
+    specobjid = basename
 
     try:
         sex_result = run_sextractor(fits_path)
@@ -150,75 +173,100 @@ def process_fits_file(fits_path, band):
             header = hdu[0].header
 
         sigma, depth, zp_avg = estimate_image_depth(data, header)
-
         ra = header.get("RA") or header.get("CRVAL1")
         dec = header.get("DEC") or header.get("CRVAL2")
-
         ps1_psf_fwhm = query_ps1_psf_fwhm(ra, dec, band) if ra and dec else None
 
         print(f"\n=== {fits_path} ===")
-        print(f"Estimated image depth (proxy): {depth} mag | RMS: {sigma} | Avg ZP: {zp_avg} | PS1 Seeing FWHM: {ps1_psf_fwhm if ps1_psf_fwhm is not None else 'N/A'}")
+        print(f"Estimated image depth: {depth} mag | RMS: {sigma} | Avg ZP: {zp_avg} | PS1 Seeing FWHM: {ps1_psf_fwhm}")
 
-        # === NEW: skip if FWHM or depth missing ===
-        if ps1_psf_fwhm is None:
-            print(f"Skipping CSV write for {fits_path} — no PS1 seeing FWHM available.")
+        if ps1_psf_fwhm is None or depth is None:
+            print(f"Skipping CSV update for {fits_path} — missing PS1 seeing FWHM or depth.")
             return
 
-        if depth is None:
-            print(f"Skipping CSV write for {fits_path} — image depth could not be estimated.")
-            return
+        ny, nx = data.shape
+        Y, X = np.mgrid[:ny, :nx]
 
-        specobjid = header.get("SPECOBJID", basename)
+        def sersic2d_lmfit(X, Y, amplitude, r_eff, n, x_0, y_0, ellip, theta):
+            model = models.Sersic2D(amplitude=amplitude, r_eff=r_eff, n=n,
+                                    x_0=x_0, y_0=y_0, ellip=ellip, theta=theta)
+            return model(X, Y).ravel()
 
+        sersic_model = Model(sersic2d_lmfit, independent_vars=['X', 'Y'])
+
+        params = Parameters()
+        params.add('amplitude', value=data.max(), min=0)
+        params.add('r_eff', value=30, min=1)
+        params.add('n', value=4.0, min=0.5, max=8)
+        params.add('x_0', value=nx/2, min=0, max=nx)
+        params.add('y_0', value=ny/2, min=0, max=ny)
+        params.add('ellip', value=0.2, min=0, max=0.99)
+        params.add('theta', value=np.random.uniform(0, np.pi), min=0, max=np.pi)
+
+        result = sersic_model.fit(data.ravel(), params, X=X, Y=Y)
+
+        centroid_x = result.params['x_0'].value
+        centroid_y = result.params['y_0'].value
+        axis_ratio_q = 1 - result.params['ellip'].value
+        position_angle_deg = np.degrees(result.params['theta'].value)
+
+        print(f"Lens (LMFIT Sersic): Centroid ({centroid_x}, {centroid_y}), "
+              f"q={axis_ratio_q}, PA={position_angle_deg} deg")
+
+        # PSF stars
         star_count = 0
-        for row in sex_result:
-            if row['CLASS_STAR'] < SEX_CLASS_STAR_CUTOFF:
+        for row_star in sex_result:
+            if row_star['CLASS_STAR'] < SEX_CLASS_STAR_CUTOFF:
                 continue
-            fwhm = row['FWHM_IMAGE']
+            fwhm = row_star['FWHM_IMAGE']
             if not (MIN_FWHM <= fwhm <= MAX_FWHM):
                 continue
             bin_index = round(fwhm / FWHM_BIN_WIDTH) * FWHM_BIN_WIDTH
-            cutout = extract_psf_cutout(data, row['X_IMAGE'], row['Y_IMAGE'])
+            cutout = extract_psf_cutout(data, row_star['X_IMAGE'], row_star['Y_IMAGE'])
             if cutout is not None:
                 cutouts_by_bin[bin_index].append(cutout)
                 star_count += 1
 
-        print(f"Stars passing quality cuts: {star_count}")
+        print(f"Stars for PSF: {star_count}")
 
         for fwhm_bin, cutouts in cutouts_by_bin.items():
             if PSF_STACK_MIN <= len(cutouts) <= PSF_STACK_MAX:
                 stack = np.median(np.array(cutouts), axis=0)
-                out_path = os.path.join(output_dir, f"psf_model_{fwhm_bin:.2f}.fits")
+                out_path = os.path.join(output_dir, f"psf_model_{fwhm_bin}.fits")
                 fits.writeto(out_path, stack, overwrite=True)
-                print(f"Saved PSF model to {out_path} with {len(cutouts)} stars")
-            else:
-                print(f"Skipping bin {fwhm_bin:.2f} — only {len(cutouts)} stars (need {PSF_STACK_MIN}–{PSF_STACK_MAX})")
+                print(f"Saved PSF: {out_path} ({len(cutouts)} stars)")
 
+        # Append CSV
         write_header = not os.path.exists(csv_file)
-        with open(csv_file, "a", newline='') as f:
-            writer = csv.writer(f)
+        with open(csv_file, "a", newline="") as csvfile:
+            writer = csv.writer(csvfile)
             if write_header:
-                writer.writerow(["specobjid", "image_depth", "ps1_seeing_fwhm"])
-            writer.writerow([specobjid, depth, ps1_psf_fwhm])
+                writer.writerow(["specobjid", "image_depth", "ps1_seeing_fwhm",
+                                 "centroid_x", "centroid_y", "axis_ratio_q", "position_angle_deg"])
+            writer.writerow([specobjid, depth, ps1_psf_fwhm,
+                             centroid_x, centroid_y, axis_ratio_q, position_angle_deg])
+
+        print(f"Appended CSV row for {specobjid}")
 
     except Exception as e:
-        print(f"Failed to process {fits_path}: {e}")
+        print(f"Failed on {fits_path}: {e}")
 
-# === Batch processor ===
-def build_psf_library_serial():
+
+# === Batch processor with Pool ===
+def build_psf_library_parallel():
+    tasks = []
     for band in BANDS:
         fits_files = sorted(glob(os.path.join(CUTOUT_FOLDER, band, "*.fits")))
-        print(f"\nFound {len(fits_files)} files in '{band}' band.")
         for fits_path in fits_files:
-            process_fits_file(fits_path, band)
+            tasks.append((fits_path, band))
 
-# Process all fits files in cutouts/g, cutouts/r, cutouts/i automatically
-for band in ['g', 'r', 'i']:
-    fits_files = sorted(glob(os.path.join('cutouts', band, '*.fits')))
-    print(f"\nFound {len(fits_files)} files in '{band}' band.")
-    for fits_file in fits_files:
-        print(f"\nProcessing {fits_file} in band '{band}'")
-        process_fits_file(fits_file, band)
+    with Pool(processes=8) as pool:  # adjust for your CPU cores
+        pool.map(process_fits_file, tasks)
+
+
+if __name__ == "__main__":
+    build_psf_library_parallel()
+
 
 
 
