@@ -11,8 +11,6 @@ from collections import defaultdict
 from multiprocessing import Pool, Manager
 import numpy as np
 from astropy.io import fits
-from astropy.nddata import Cutout2D
-from scipy.ndimage import shift
 from lmfit import Model, Parameters
 from astropy.modeling import models
 
@@ -20,26 +18,13 @@ from astropy.modeling import models
 BANDS = ['g', 'r', 'i']
 CUTOUT_FOLDER = "cutouts"
 PSF_OUTPUT_FOLDER = "psf_models"
-STAR_SIZE = 25
-FWHM_BIN_WIDTH = 0.05
-MIN_FWHM = 0.5
-MAX_FWHM = 1.5
-SEX_CONFIG = "default.sex"
-SEX_PARAMS = "default.param"
-SEX_CLASS_STAR_CUTOFF = 0.9
-SEX_DETECT_THRESH = 3.0
-PSF_STACK_MIN = 9
-PSF_STACK_MAX = 11
 
 os.makedirs(PSF_OUTPUT_FOLDER, exist_ok=True)
-
 
 # === Shared PS1 FWHM cache ===
 ps1_cache = Manager().dict()  # shared among processes
 
-
 def query_ps1_psf_fwhm(ra, dec, band):
-    # round RA/Dec to 3 decimal to reduce identical queries
     key = (round(ra, 3), round(dec, 3), band)
     if key in ps1_cache:
         return ps1_cache[key]
@@ -92,53 +77,6 @@ def query_ps1_psf_fwhm(ra, dec, band):
         return None
 
 
-# === SExtractor ===
-def run_sextractor(fits_path):
-    catalog_path = os.path.join(tempfile.gettempdir(), f"sex_{uuid.uuid4().hex}.cat")
-    cmd = [
-        "sex", fits_path,
-        "-c", SEX_CONFIG,
-        "-PARAMETERS_NAME", SEX_PARAMS,
-        "-DETECT_THRESH", str(SEX_DETECT_THRESH),
-        "-CATALOG_NAME", catalog_path,
-        "-CATALOG_TYPE", "ASCII_HEAD"
-    ]
-    try:
-        subprocess.run(cmd, check=True)
-        if not os.path.exists(catalog_path):
-            print(f"SExtractor did not produce catalog for {fits_path}")
-            return None
-
-        if os.path.getsize(catalog_path) == 0:
-            print(f"SExtractor produced empty catalog for {fits_path}")
-            return None
-
-        data = np.genfromtxt(catalog_path, names=["X_IMAGE", "Y_IMAGE", "FWHM_IMAGE", "CLASS_STAR", "FLUX_AUTO"])
-        if data.shape == ():  # single detection
-            data = np.array([data])
-        os.remove(catalog_path)
-        return data
-
-    except subprocess.CalledProcessError as e:
-        print(f"SExtractor failed on {fits_path} with error: {e}")
-        return None
-
-
-# === PSF cutout ===
-def extract_psf_cutout(hdu_data, x, y, size=STAR_SIZE):
-    try:
-        cutout = Cutout2D(hdu_data, (x, y), (size, size), mode='partial', fill_value=0)
-        data = cutout.data
-        y_peak, x_peak = np.unravel_index(np.argmax(data), data.shape)
-        shift_y, shift_x = (size // 2 - y_peak, size // 2 - x_peak)
-        centered = shift(data, shift=(shift_y, shift_x), order=1)
-        norm = np.sum(centered)
-        return centered / norm if norm != 0 else centered
-    except Exception as e:
-        print(f"Cutout failed at position ({x}, {y}): {e}")
-        return None
-
-
 # === Image depth ===
 def estimate_image_depth(data, header):
     flattened = data.flatten()
@@ -152,22 +90,22 @@ def estimate_image_depth(data, header):
 
 # === Main processing ===
 def process_fits_file(args):
-    fits_path, band = args  # unpack for pool.map
+    fits_path, band = args
 
     basename = os.path.splitext(os.path.basename(fits_path))[0]
     output_dir = os.path.join(PSF_OUTPUT_FOLDER, band)
     os.makedirs(output_dir, exist_ok=True)
-    cutouts_by_bin = defaultdict(list)
     csv_file = os.path.join(output_dir, "psf_summary.csv")
-
     specobjid = basename
 
-    try:
-        sex_result = run_sextractor(fits_path)
-        if sex_result is None or len(sex_result) == 0:
-            print(f"No detections for {fits_path}")
-            return
+    # Skip if already done
+    if os.path.exists(csv_file):
+        with open(csv_file) as f:
+            if specobjid in f.read():
+                print(f"Already processed {specobjid}, skipping.")
+                return
 
+    try:
         with fits.open(fits_path) as hdu:
             data = hdu[0].data
             header = hdu[0].header
@@ -213,30 +151,7 @@ def process_fits_file(args):
         print(f"Lens (LMFIT Sersic): Centroid ({centroid_x}, {centroid_y}), "
               f"q={axis_ratio_q}, PA={position_angle_deg} deg")
 
-        # PSF stars
-        star_count = 0
-        for row_star in sex_result:
-            if row_star['CLASS_STAR'] < SEX_CLASS_STAR_CUTOFF:
-                continue
-            fwhm = row_star['FWHM_IMAGE']
-            if not (MIN_FWHM <= fwhm <= MAX_FWHM):
-                continue
-            bin_index = round(fwhm / FWHM_BIN_WIDTH) * FWHM_BIN_WIDTH
-            cutout = extract_psf_cutout(data, row_star['X_IMAGE'], row_star['Y_IMAGE'])
-            if cutout is not None:
-                cutouts_by_bin[bin_index].append(cutout)
-                star_count += 1
-
-        print(f"Stars for PSF: {star_count}")
-
-        for fwhm_bin, cutouts in cutouts_by_bin.items():
-            if PSF_STACK_MIN <= len(cutouts) <= PSF_STACK_MAX:
-                stack = np.median(np.array(cutouts), axis=0)
-                out_path = os.path.join(output_dir, f"psf_model_{fwhm_bin}.fits")
-                fits.writeto(out_path, stack, overwrite=True)
-                print(f"Saved PSF: {out_path} ({len(cutouts)} stars)")
-
-        # Append CSV
+        # Write CSV row if new
         write_header = not os.path.exists(csv_file)
         with open(csv_file, "a", newline="") as csvfile:
             writer = csv.writer(csvfile)
@@ -260,7 +175,7 @@ def build_psf_library_parallel():
         for fits_path in fits_files:
             tasks.append((fits_path, band))
 
-    with Pool(processes=8) as pool:  # adjust for your CPU cores
+    with Pool(processes=8) as pool:
         pool.map(process_fits_file, tasks)
 
 
